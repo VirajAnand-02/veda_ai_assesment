@@ -1,0 +1,41 @@
+{
+  "name": "veda_ai_assesment",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 3001",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^4.0.65",
+    "@ai-sdk/deepseek": "^3.0.54",
+    "@ai-sdk/google": "^4.0.82",
+    "@ai-sdk/groq": "^4.0.50",
+    "@ai-sdk/openai": "^4.0.77",
+    "@ai-sdk/openai-compatible": "^3.0.57",
+    "@ai-sdk/react": "^4.0.119",
+    "@openrouter/ai-sdk-provider": "^3.1.0",
+    "@supabase/supabase-js": "^2.117.2",
+    "ai": "^7.0.116",
+    "jsonrepair": "^3.15.0",
+    "lucide-react": "^1.48.0",
+    "next": "16.3.6",
+    "pdfjs-dist": "^6.3.289",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "sharp": "^0.35.4",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.3.6",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}
