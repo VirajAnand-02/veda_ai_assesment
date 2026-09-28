@@ -7,7 +7,7 @@ let client: SupabaseClient | undefined;
 // Server-only client using the secret key, which bypasses storage policies.
 // It is needed to read uploaded pages back, since the browser key can only
 // upload. Never import this from client code.
-function getSupabaseAdmin(): SupabaseClient {
+export function getSupabaseAdmin(): SupabaseClient {
   if (client) return client;
 
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;

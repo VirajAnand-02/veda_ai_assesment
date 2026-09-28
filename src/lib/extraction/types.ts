@@ -81,3 +81,18 @@ export type ExtractionEvent =
   | { type: "progress"; stage: ServerStage; status: "active" | "done"; detail?: string }
   | { type: "result"; result: ExtractionResult }
   | { type: "error"; message: string };
+
+export type ProgressEvent = Extract<ExtractionEvent, { type: "progress" }>;
+
+/** A running or finished extraction, as polled by the page (GET /api/extract/<id>). */
+export type ExtractionJob = {
+  id: string;
+  status: "running" | "done" | "error";
+  /** Progress so far, in order; the page replays the ones it hasn't seen. */
+  events: ProgressEvent[];
+  result?: ExtractionResult;
+  /** Set when status is "error"; meant for the teacher. */
+  error?: string;
+  /** When the job was last written (ms); a running job refreshes it at least every ~20 s. */
+  updatedAt: number;
+};
