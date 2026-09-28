@@ -4,7 +4,7 @@
 
 export type BatchItem = { id: string; marks: number };
 
-export const MARKS_PER_BATCH = 9;
+export const MARKS_PER_BATCH = 12;
 
 /**
  * k = ceil(total marks / 9) batches (at least 1, at most one per question).
