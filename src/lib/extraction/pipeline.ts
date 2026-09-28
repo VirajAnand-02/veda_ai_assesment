@@ -9,6 +9,15 @@ import { jsonrepair } from "jsonrepair";
 import { z } from "zod";
 import { applyChoiceRules, formatLabel, parseLabel, type ChoiceRule } from "./choices";
 import { unionBox, type BoxFormat } from "./geometry";
+import { proposeMatches, type Proposal } from "./label-match";
+import { planBatches } from "./grading-batches";
+import {
+  COMPLEX_QUESTION,
+  gradingTier,
+  reasoningEnabled,
+  reasoningOptions,
+  type ReasoningTier,
+} from "@/lib/ai/reasoning";
 import type { ExtractionRequest, PageInput } from "./request-schema";
 import type {
   Box,
@@ -226,7 +235,7 @@ async function extractQuestions(lines: Line[], deps: PipelineDeps): Promise<Ques
 
   const output = await ask(deps, deps.textModel, questionSchema, QUESTION_INSTRUCTIONS, {
     prompt: formatLines(lines),
-  });
+  }, { label: "questions" });
 
   let entries = output.questions
     .filter((question) => question.text.trim())
@@ -303,7 +312,7 @@ async function extractAnswers(lines: Line[], deps: PipelineDeps): Promise<Answer
 
   const output = await ask(deps, deps.textModel, answerSchema, ANSWER_INSTRUCTIONS, {
     prompt: formatLines(lines),
-  });
+  }, { label: "answers" });
 
   const indexById = new Map(lines.map((line) => [line.id, line.index]));
   const segments: AnswerSegment[] = [];
@@ -334,18 +343,20 @@ function regionsFor(lines: Line[]): Region[] {
 // ---------------------------------------------------------------------------
 // Mapping
 
+// The student's labels are matched in code first (label-match.ts); the model
+// checks those matches against the content and matches the rest.
 const MAPPING_INSTRUCTIONS = `You match a student's answer blocks to the questions of an exam.
 Questions are labelled with their full path, e.g. "1(a)(ii)" is sub-part ii of part a of question 1.
-Match each answer block to the question(s) it answers:
-1. First use the label the student wrote. Treat "Q2", "2.", "Ans 2" and "2)" as question 2; "11 b", "11(b)", "11-b" and "11.b" as 11(b); "1 a ii", "1.a.ii" and "1(a)(ii)" as 1(a)(ii). A bare label such as "(b)" or "ii." belongs to the question being answered around it on the sheet.
-2. If there is no usable label, or the label contradicts the content, use the content of the answer.
-3. If one block answers several sub-parts together (e.g. the student labelled it "1(a)" and answered both 1(a)(i) and 1(a)(ii) in it), list all of them.
-Students may answer in any order. Several blocks can belong to the same question (for example an answer continued later on).
-Use an empty list for a block that does not answer any of the listed questions. Do not force a match.
-Return one entry per answer block.`;
+Each answer block comes with a match proposed from the label the student wrote, or "none".
+1. Check every proposal against the block's content. Keep it when the content answers that question.
+2. Students sometimes write the wrong label (e.g. "3(b)" over an answer to 3(c)). When the content clearly answers a different question, correct the match. Blocks marked CHECK have a reason to doubt their label; look at them closely.
+3. For a block proposed as a whole parent (e.g. "1(a)" -> 1(a)(i) and 1(a)(ii)), keep only the sub-parts it actually answers.
+4. Match every block with no proposal: by its label if it has one (a bare "(b)" or "ii." belongs to the question answered around it on the sheet), otherwise by its content.
+Students may answer in any order, and several blocks can belong to the same question (an answer continued later on). Use an empty list for a block that answers none of the questions; do not force a match.
+Return ONLY the blocks whose match you change and the blocks that had no proposal, each with the question ids and a short reason. Blocks you leave out keep their proposal.`;
 
 const mappingSchema = z.object({
-  matches: z.array(z.object({ answerId: z.string(), questionIds: z.array(z.string()) })),
+  changes: z.array(z.object({ answerId: z.string(), questionIds: z.array(z.string()), reason: z.string() })),
 });
 
 async function mapAnswers(
@@ -356,6 +367,14 @@ async function mapAnswers(
   const matches = new Map<string, string[]>();
   if (segments.length === 0) return matches;
 
+  const proposals = proposeMatches(questions, segments);
+  const labelOf = new Map(questions.map((question) => [question.id, question.label]));
+  const describe = (proposal: Proposal | null) => {
+    if (!proposal?.questionIds.length) return "none";
+    const named = proposal.questionIds.map((id) => `${id} ${labelOf.get(id)}`).join(", ");
+    return `${named} (${proposal.source === "parent" ? "a parent label" : proposal.source === "inferred" ? "read from the labels around it" : "from the label"})`;
+  };
+
   const prompt = [
     "QUESTIONS (id | label | text):",
     ...questions.map(
@@ -363,21 +382,41 @@ async function mapAnswers(
         `${q.id} | ${q.label} | ${q.context ? `${truncate(oneLine(q.context), 150)} → ` : ""}${truncate(oneLine(q.text), 300)}`,
     ),
     "",
-    "ANSWER BLOCKS (id | student's label | text):",
-    ...segments.map(
-      (a) => `${a.id} | ${a.studentLabel ?? "none"} | ${truncate(oneLine(a.text), 600)}`,
-    ),
+    "ANSWER BLOCKS (id | student's label | proposed | text):",
+    ...segments.map((a) => {
+      const proposal = proposals.get(a.id) ?? null;
+      const check = proposal?.flags.length ? ` | CHECK: ${proposal.flags.join("; ")}` : "";
+      return `${a.id} | ${a.studentLabel ? truncate(oneLine(a.studentLabel), 80) : "none"} | proposed: ${describe(proposal)}${check} | ${truncate(oneLine(a.text), 600)}`;
+    }),
   ].join("\n");
 
-  const output = await ask(deps, deps.textModel, mappingSchema, MAPPING_INSTRUCTIONS, { prompt });
+  // Code proposals stand unless the model changes them.
+  for (const segment of segments) matches.set(segment.id, proposals.get(segment.id)?.questionIds ?? []);
+
+  let changes: z.infer<typeof mappingSchema>["changes"];
+  try {
+    ({ changes } = await ask(deps, deps.textModel, mappingSchema, MAPPING_INSTRUCTIONS, { prompt }, { tier: "light", label: "mapping" }));
+  } catch (error) {
+    if (deps.signal?.aborted) throw error;
+    // Grading can still go ahead on the students' own labels.
+    console.warn("Mapping check failed; using the matches from the students' labels only.", error);
+    return matches;
+  }
 
   const questionIds = new Set(questions.map((question) => question.id));
-  const answerIds = new Set(segments.map((segment) => segment.id));
-  for (const match of output.matches) {
-    const answerId = match.answerId.trim();
-    if (!answerIds.has(answerId) || matches.has(answerId)) continue;
-    const ids = [...new Set(match.questionIds.map((id) => id.trim()))].filter((id) => questionIds.has(id));
+  const changed = new Set<string>();
+  for (const change of changes) {
+    const answerId = change.answerId.trim();
+    if (!matches.has(answerId) || changed.has(answerId)) continue;
+    const ids = [...new Set(change.questionIds.map((id) => id.trim()))].filter((id) => questionIds.has(id));
+    const before = matches.get(answerId)!;
     matches.set(answerId, ids);
+    changed.add(answerId);
+    if (before.length && before.join() !== ids.join()) {
+      console.info(
+        `Mapping: ${answerId} proposed ${before.map((id) => labelOf.get(id)).join("+")} -> ${ids.map((id) => labelOf.get(id)).join("+") || "none"} (${change.reason.trim()})`,
+      );
+    }
   }
   return matches;
 }
@@ -392,7 +431,7 @@ For every question return:
 - "maxMarks": the printed marks when given; otherwise choose a fair maximum for that kind of question (usually 1-5, at most 10).
 - "score": the marks earned, between 0 and maxMarks, in steps of 0.5. Award partial credit for partially correct answers. An answer marked NO ANSWER scores 0. When several sub-parts share the same answer text (the student answered them together), grade only the portion relevant to each sub-part.
 - "feedback": 1-3 sentences addressed to the student: what was right, what was missing or wrong, and how to improve. For NO ANSWER, briefly state what a good answer should contain.
-Then give overall feedback: a short paragraph on the whole paper, plus up to 3 strengths and up to 3 things to improve.`;
+You are given some of the paper's questions; grade exactly those.`;
 
 const gradingSchema = z.object({
   grades: z.array(
@@ -403,12 +442,25 @@ const gradingSchema = z.object({
       feedback: z.string(),
     }),
   ),
-  overall: z.object({
-    feedback: z.string(),
-    strengths: z.array(z.string()),
-    improvements: z.array(z.string()),
-  }),
 });
+
+const OVERALL_INSTRUCTIONS = `You are an experienced teacher. From the per-question results of a student's graded exam, write overall feedback for the student: a short paragraph on the whole paper, plus up to 3 strengths and up to 3 things to improve. Base it only on the results given.`;
+
+const overallSchema = z.object({
+  feedback: z.string(),
+  strengths: z.array(z.string()),
+  improvements: z.array(z.string()),
+});
+
+/** Marks assumed for a question whose marks aren't printed, when planning batches. */
+const ESTIMATED_MARKS = 3;
+/**
+ * The weight of an unanswered question when planning batches. It still goes to
+ * the model (for "what a good answer contains" feedback) but is quick to grade,
+ * so skipped questions and optional choices don't inflate the batch count.
+ */
+const UNANSWERED_WEIGHT = 1;
+const GRADING_CONCURRENCY = 3;
 
 async function gradeAnswers(
   { questions, choices }: QuestionPaper,
@@ -418,25 +470,53 @@ async function gradeAnswers(
   const answers = new Map(
     questions.map((question) => [question.id, mergeAnswers(answersByQuestion.get(question.id))]),
   );
+  const marksOf = (question: ExtractedQuestion) => question.printedMarks ?? ESTIMATED_MARKS;
+  const byId = new Map(questions.map((question) => [question.id, question]));
 
-  const prompt = questions
-    .map((question) => {
-      const answer = answers.get(question.id);
-      return [
-        `### ${question.id} — Question ${question.label}`,
-        `Marks: ${question.printedMarks ?? "not printed"}`,
-        question.context ? `Context: ${question.context}` : null,
-        `Question: ${question.text}`,
-        // Answers with tables run long (two comparison tables are ~2,000 characters).
-        `Student's answer: ${answer ? truncate(answer.text, 5000) : "NO ANSWER"}`,
-      ]
-        .filter(Boolean)
-        .join("\n");
-    })
-    .join("\n\n");
-
-  const output = await ask(deps, deps.textModel, gradingSchema, GRADING_INSTRUCTIONS, { prompt });
-  const grades = new Map(output.grades.map((grade) => [grade.questionId.trim(), grade]));
+  // About one batch per 9 marks, small questions together (grading-batches.ts),
+  // each thinking as hard as its questions need (lib/ai/reasoning.ts).
+  const batches = planBatches(
+    questions.map((question) => ({
+      id: question.id,
+      marks: answers.get(question.id) ? marksOf(question) : UNANSWERED_WEIGHT,
+    })),
+  );
+  const failed: string[] = [];
+  const batchGrades = await mapWithLimit(batches, GRADING_CONCURRENCY, async (ids) => {
+    const batch = ids.map((id) => byId.get(id)!);
+    const answered = batch.filter((question) => answers.get(question.id));
+    const tier = gradingTier({
+      answeredMarks: answered.map(marksOf),
+      answerChars: answered.map((question) => answers.get(question.id)!.text.length),
+      complex: answered.some((question) => marksOf(question) >= 5 && COMPLEX_QUESTION.test(`${question.context ?? ""} ${question.text}`)),
+    });
+    const prompt = batch
+      .map((question) => {
+        const answer = answers.get(question.id);
+        return [
+          `### ${question.id} — Question ${question.label}`,
+          `Marks: ${question.printedMarks ?? "not printed"}`,
+          question.context ? `Context: ${question.context}` : null,
+          `Question: ${question.text}`,
+          // Answers with tables run long (two comparison tables are ~2,000 characters).
+          `Student's answer: ${answer ? truncate(answer.text, 5000) : "NO ANSWER"}`,
+        ]
+          .filter(Boolean)
+          .join("\n");
+      })
+      .join("\n\n");
+    const label = `grading ${batch.map((question) => question.label).join(", ")}`;
+    try {
+      return (await ask(deps, deps.textModel, gradingSchema, GRADING_INSTRUCTIONS, { prompt }, { tier, label })).grades;
+    } catch (error) {
+      if (deps.signal?.aborted) throw error;
+      // The rest of the paper is still graded; these questions are flagged for review.
+      console.warn(`Grading failed for ${batch.map((question) => question.label).join(", ")}.`, error);
+      failed.push(...batch.map((question) => question.label));
+      return [];
+    }
+  });
+  const grades = new Map(batchGrades.flat().map((grade) => [grade.questionId.trim(), grade]));
 
   const scored = questions.map(({ printedMarks, ...question }) => {
     const grade = grades.get(question.id);
@@ -481,6 +561,19 @@ async function gradeAnswers(
   const counts: Record<Verdict, number> = { correct: 0, partial: 0, incorrect: 0, unanswered: 0 };
   for (const question of graded) if (question.counted) counts[question.verdict]++;
 
+  // Overall feedback from the per-question results: a small, light call.
+  const results = graded
+    .map((question) => `Q${question.label} (${question.score}/${question.maxMarks}, ${question.verdict}${question.counted ? "" : ", not counted"}): ${truncate(oneLine(question.feedback), 300)}`)
+    .join("\n");
+  let overall: z.infer<typeof overallSchema> = { feedback: "", strengths: [], improvements: [] };
+  try {
+    overall = await ask(deps, deps.textModel, overallSchema, OVERALL_INSTRUCTIONS, { prompt: results }, { tier: "light", label: "overall feedback" });
+  } catch (error) {
+    if (deps.signal?.aborted) throw error;
+    console.warn("Overall feedback failed; the per-question feedback stands.", error);
+  }
+  if (failed.length) notes.push(`Q${failed.join(", Q")} could not be graded automatically; please review ${failed.length === 1 ? "it" : "them"}.`);
+
   return {
     questions: graded,
     summary: {
@@ -490,9 +583,9 @@ async function gradeAnswers(
       counts,
       notCounted: graded.filter((question) => !question.counted).length,
       notes,
-      overallFeedback: output.overall.feedback.trim(),
-      strengths: output.overall.strengths.map((item) => item.trim()).filter(Boolean).slice(0, 3),
-      improvements: output.overall.improvements.map((item) => item.trim()).filter(Boolean).slice(0, 3),
+      overallFeedback: overall.feedback.trim(),
+      strengths: overall.strengths.map((item) => item.trim()).filter(Boolean).slice(0, 3),
+      improvements: overall.improvements.map((item) => item.trim()).filter(Boolean).slice(0, 3),
     },
   };
 }
@@ -540,23 +633,37 @@ export function repairStructuredOutput<T>(text: string | undefined, schema: z.Zo
   }
 }
 
-/** Structured call; broken JSON is repaired, and one retry covers a reply that can't be. */
+/**
+ * Structured call; broken JSON is repaired, and one retry covers a reply that
+ * can't be. `tier` sets how much a reasoning model thinks (AI_REASONING);
+ * `label` logs the call's tier, reasoning tokens and time.
+ */
 async function ask<T>(
   deps: Pick<PipelineDeps, "signal">,
   model: LanguageModel,
   schema: z.ZodType<T>,
   instructions: string,
   input: { prompt: string } | { messages: ModelMessage[] },
+  { tier, label }: { tier?: ReasoningTier; label?: string } = {},
 ): Promise<T> {
+  const providerOptions = tier && reasoningEnabled() ? reasoningOptions(model, tier) : undefined;
   for (let attempt = 1; ; attempt++) {
+    const started = Date.now();
     try {
-      const { output } = await generateText({
+      const { output, usage } = await generateText({
         model,
         instructions,
         ...input,
         output: Output.object({ schema }),
+        providerOptions,
         abortSignal: deps.signal,
       });
+      if (label) {
+        const reasoning = usage.outputTokenDetails?.reasoningTokens;
+        console.info(
+          `[${label}] ${providerOptions ? `${tier} reasoning` : "default reasoning"}, ${reasoning ?? "?"} reasoning tokens, ${((Date.now() - started) / 1000).toFixed(1)}s`,
+        );
+      }
       return output as T;
     } catch (error) {
       if (!NoObjectGeneratedError.isInstance(error)) throw error;
