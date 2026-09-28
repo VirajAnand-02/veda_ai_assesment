@@ -41,3 +41,5 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 .venv
+# Archived OCR experiments (HunyuanOCR, Mistral, Groq, the /ocr lab, ...), kept locally only
+/old_ocr/

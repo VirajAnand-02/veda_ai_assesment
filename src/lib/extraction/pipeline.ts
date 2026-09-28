@@ -8,7 +8,7 @@ import {
 import { jsonrepair } from "jsonrepair";
 import { z } from "zod";
 import { applyChoiceRules, formatLabel, parseLabel, type ChoiceRule } from "./choices";
-import { boxFromFormat, unionBox, type BoxFormat } from "./geometry";
+import { unionBox, type BoxFormat } from "./geometry";
 import type { ExtractionRequest, PageInput } from "./request-schema";
 import type {
   Box,
@@ -141,72 +141,15 @@ async function readDocument(
   return lines;
 }
 
-// How each box format is described to the model.
+// How each box format is described to the vision model (used by the drawing finder, lib/ocr/structure.ts).
 export const BOX_WORDING: Record<BoxFormat, { field: string; description: string }> = {
   yxyx1000: { field: "box_2d", description: "[ymin, xmin, ymax, xmax], normalised to 0-1000" },
   xyxy1000: { field: "bbox_2d", description: "[x1, y1, x2, y2] (top-left, bottom-right), normalised to 0-1000" },
   xyxy999: { field: "box", description: "[x1, y1, x2, y2] (top-left, bottom-right), normalised to integers 0-999" },
 };
 
-function transcribeInstructions(format: BoxFormat) {
-  const { field, description } = BOX_WORDING[format];
-  return `You are an OCR engine for school exam documents (printed question papers and handwritten answer sheets).
-Transcribe every line of writing on the page image, in reading order: top to bottom, and the left column before the right column.
-For each line return:
-- "text": the line exactly as written, including question labels such as "Q2.", "11 (b)" or "Ans 3". Keep the student's spelling. Write illegible words as [illegible]. Skip words that are struck through.
-- "${field}": the line's bounding box as ${description}, relative to the whole image. The box must tightly enclose the ink of that line.
-Return one entry per physical line; never merge lines.
-For a drawing, diagram, graph or table, return a single entry whose box covers the whole drawing and whose text is "[diagram: short description, including its labels]".
-Ignore ruled lines, margins, page numbers, headers, footers and watermarks.`;
-}
-
-function transcriptionSchema(format: BoxFormat) {
-  const { field, description } = BOX_WORDING[format];
-  return z.object({
-    lines: z.array(
-      z.object({ text: z.string(), [field]: z.array(z.number()).describe(description) }),
-    ),
-  });
-}
-
-export type TranscribeOptions = {
-  model: LanguageModel;
-  signal?: AbortSignal;
-  /** The box convention to ask for; match the model's training. Default "yxyx1000". */
-  boxFormat?: BoxFormat;
-};
-
-/** Reads one page image with a vision model into positioned lines. */
-export async function transcribePage(image: Uint8Array, options: TranscribeOptions): Promise<TextLine[]> {
-  const format = options.boxFormat ?? "yxyx1000";
-  const messages: ModelMessage[] = [
-    {
-      role: "user",
-      content: [
-        { type: "text", text: "Transcribe this page." },
-        {
-          type: "file",
-          data: image,
-          mediaType: "image/jpeg",
-          providerOptions: { deepseek: { imageDetail: "high" } },
-        },
-      ],
-    },
-  ];
-  const output = (await ask(options, options.model, transcriptionSchema(format), transcribeInstructions(format), {
-    messages,
-  })) as { lines: Record<string, unknown>[] };
-  const field = BOX_WORDING[format].field;
-  return output.lines.flatMap((line) => {
-    const text = typeof line.text === "string" ? line.text.trim() : "";
-    const values = line[field];
-    const box = Array.isArray(values) ? boxFromFormat(values.map(Number), format) : null;
-    return text && box ? [{ text, box }] : [];
-  });
-}
-
-// Scanned pages read by a structure-aware reader (AI_OCR_ENGINE=nemotron-v1,
-// paddle-llm, …) include one line per table and per drawing.
+// Scanned pages (AI_OCR_ENGINE=nemotron-v1 or paddle-llm) include one line per
+// table and per drawing.
 const REGION_NOTE = `Some lines stand for a region of the page rather than a line of writing: "[diagram: …]" is a drawing described in words, with its labels, and "[table: …]" is a table whose rows are separated by " / " and cells by " | ".`;
 
 // ---------------------------------------------------------------------------

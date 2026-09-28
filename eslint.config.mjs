@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Archived OCR experiments, kept locally and out of git.
+    "old_ocr/**",
   ]),
 ]);
 

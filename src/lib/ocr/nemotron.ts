@@ -10,14 +10,13 @@ import {
   type PageElementsResponse,
 } from "./parse-nemotron";
 
-// NVIDIA's hosted Nemotron models (NIM, build.nvidia.com): OCR v1/v2 for text,
-// and page-elements-v3, which finds tables, charts and infographics.
+// NVIDIA's hosted Nemotron models (NIM, build.nvidia.com): OCR v1 for text
+// (v2 misread more handwriting in tests), and page-elements-v3, which finds
+// tables, charts and infographics.
 //   NVIDIA_API_KEY=nvapi-...
 //   NVIDIA_OCR_BASE_URL=https://ai.api.nvidia.com/v1/cv/nvidia   (default)
 
-export const NEMOTRON_MODELS = { "nemotron-v1": "nemotron-ocr-v1", "nemotron-v2": "nemotron-ocr-v2" } as const;
-export type NemotronVersion = keyof typeof NEMOTRON_MODELS;
-
+const OCR_MODEL = "nemotron-ocr-v1";
 const PAGE_ELEMENTS_MODEL = "nemotron-page-elements-v3";
 const DEFAULT_BASE_URL = "https://ai.api.nvidia.com/v1/cv/nvidia";
 
@@ -30,14 +29,12 @@ function getNemotronConfig() {
 export async function readWithNemotron(
   image: Uint8Array,
   mediaType: string,
-  version: NemotronVersion,
   signal?: AbortSignal,
 ): Promise<{ lines: TextLine[]; segments: TextLine[]; model: string }> {
-  const model = NEMOTRON_MODELS[version];
   // "sentence" returns about one detection per line; "word" and "paragraph" also exist.
-  const data = await callNvidia<NemotronResponse>(model, image, mediaType, { merge_levels: ["sentence"] }, signal);
+  const data = await callNvidia<NemotronResponse>(OCR_MODEL, image, mediaType, { merge_levels: ["sentence"] }, signal);
   const segments = parseNemotronSegments(data);
-  return { lines: mergeWordsIntoLines(segments), segments, model: `nvidia/${model}` };
+  return { lines: mergeWordsIntoLines(segments), segments, model: `nvidia/${OCR_MODEL}` };
 }
 
 /** Tables, charts, infographics, titles, … on the page. Printed documents only: it doesn't see hand drawings. */
@@ -81,11 +78,4 @@ async function callNvidia<T>(
     );
   }
   return data;
-}
-
-/** For the /ocr page's engine list; doesn't call the API. */
-export function nemotronStatus(version: NemotronVersion) {
-  return getNemotronConfig()
-    ? { configured: true, model: `nvidia/${NEMOTRON_MODELS[version]}` }
-    : { configured: false, error: "NVIDIA_API_KEY is not set" };
 }

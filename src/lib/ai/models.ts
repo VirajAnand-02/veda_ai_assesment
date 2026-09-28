@@ -62,7 +62,7 @@ export function getModel(role: ModelRole) {
   return modelById(getModelId(role));
 }
 
-/** A model by "<provider>:<model id>", e.g. for the /ocr page's extra columns. */
+/** A model by "<provider>:<model id>". */
 export function modelById(id: string) {
   // The id comes from .env, so it can't be checked against the registry's types.
   return registry.languageModel(id as Parameters<typeof registry.languageModel>[0]);

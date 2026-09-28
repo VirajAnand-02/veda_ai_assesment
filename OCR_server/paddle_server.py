@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Gateway in front of llama-server, started by `ocr_server.py start`.
+PaddleOCR HTTP server, started by `ocr_server.py start`.
 
-- /v1/*, /health, everything else: proxied to llama-server (HunyuanOCR), which
-  listens on an internal port, so clients keep using http://host:OCR_PORT/v1.
-- POST /paddle/ocr: PaddleOCR (PP-OCR via RapidOCR + ONNX Runtime, on CPU).
-- GET  /paddle/health: whether PaddleOCR is loaded.
+- POST /paddle/ocr     JSON {"image": "<base64 or data URL>"} -> text lines with boxes
+- GET  /paddle/health  whether PaddleOCR is loaded
+- GET  /health         the server itself
 
-Standard library only, except PaddleOCR, which needs the packages that
-`ocr_server.py setup` installs into OCR_server/.venv.
+PP-OCR detection + recognition via RapidOCR + ONNX Runtime, on CPU. Needs the
+packages that `ocr_server.py setup` installs into OCR_server/.venv.
 """
 
 from __future__ import annotations
@@ -16,13 +15,11 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
-import http.client
 import json
 import os
 import sys
 import threading
 import time
-import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 for _stream in (sys.stdout, sys.stderr):
@@ -30,10 +27,7 @@ for _stream in (sys.stdout, sys.stderr):
     if _reconfigure:
         _reconfigure(encoding="utf-8", errors="replace")
 
-# A page can take minutes on CPU; don't give up on llama-server before that.
-UPSTREAM_TIMEOUT = 30 * 60
 MAX_BODY = 64 * 1024 * 1024
-HOP_BY_HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-connection", "host"}
 
 # PaddleOCR model presets (RapidOCR parameter names). Measured on this
 # project's test pages (Ryzen 5 5600H, CPU):
@@ -128,34 +122,30 @@ def decode_image(value: str) -> bytes:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "HunyuanOCR-gateway/1.0"
+    server_version = "PaddleOCR-server/1.0"
     protocol_version = "HTTP/1.1"
 
     # Filled in by main().
-    upstream: urllib.parse.SplitResult
     api_key: str = ""
     paddle: Paddle | None = None
     paddle_error: str | None = None
 
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002
-        if os.environ.get("OCR_GATEWAY_LOG"):
+        if os.environ.get("OCR_SERVER_LOG"):
             super().log_message(format, *args)
 
-    # -- routing ------------------------------------------------------------
-
     def do_GET(self) -> None:  # noqa: N802
-        if self.path.split("?")[0] == "/paddle/health":
+        path = self.path.split("?")[0]
+        if path == "/paddle/health":
             return self.paddle_health()
-        self.proxy()
+        if path == "/health":
+            return self.send_json(200, {"status": "ok"})
+        self.send_json(404, {"error": "Not found. Routes: POST /paddle/ocr, GET /paddle/health, GET /health."})
 
     def do_POST(self) -> None:  # noqa: N802
         if self.path.split("?")[0] == "/paddle/ocr":
             return self.paddle_ocr()
-        self.proxy()
-
-    do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_HEAD = lambda self: self.proxy()  # noqa: E731
-
-    # -- PaddleOCR ------------------------------------------------------------
+        self.send_json(404, {"error": "Not found. Routes: POST /paddle/ocr, GET /paddle/health, GET /health."})
 
     def authorized(self) -> bool:
         if not self.api_key:
@@ -171,13 +161,13 @@ class Handler(BaseHTTPRequestHandler):
         if self.paddle:
             self.send_json(200, {"ready": True, "model": f"PaddleOCR {self.paddle.preset} (RapidOCR)"})
         else:
-            self.send_json(503, {"ready": False, "error": self.paddle_error or "PaddleOCR is turned off (OCR_PADDLE=off)."})
+            self.send_json(503, {"ready": False, "error": self.paddle_error or "PaddleOCR is not loaded."})
 
     def paddle_ocr(self) -> None:
         if not self.authorized():
             return
         if not self.paddle:
-            self.send_json(503, {"error": self.paddle_error or "PaddleOCR is turned off (OCR_PADDLE=off)."})
+            self.send_json(503, {"error": self.paddle_error or "PaddleOCR is not loaded."})
             return
         body = self.read_body()
         if body is None:
@@ -195,47 +185,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(500, {"error": f"PaddleOCR failed: {error}"})
             return
         self.send_json(200, result)
-
-    # -- proxy to llama-server -------------------------------------------------
-
-    def proxy(self) -> None:
-        body = self.read_body() if self.command in ("POST", "PUT", "PATCH") else b""
-        if body is None:
-            return
-        headers = {key: value for key, value in self.headers.items() if key.lower() not in HOP_BY_HOP}
-        headers["Host"] = self.upstream.netloc
-        connection = http.client.HTTPConnection(
-            self.upstream.hostname or "127.0.0.1", self.upstream.port, timeout=UPSTREAM_TIMEOUT
-        )
-        try:
-            connection.request(self.command, self.path, body=body or None, headers=headers)
-            response = connection.getresponse()
-        except OSError as error:
-            connection.close()
-            self.send_json(502, {"error": f"HunyuanOCR (llama-server) is not reachable: {error}"})
-            return
-
-        try:
-            self.send_response(response.status, response.reason)
-            length = response.getheader("Content-Length")
-            for key, value in response.getheaders():
-                if key.lower() not in HOP_BY_HOP:
-                    self.send_header(key, value)
-            if length is None:
-                # Streamed (e.g. SSE): pass it through, then close.
-                self.send_header("Connection", "close")
-                self.close_connection = True
-            self.end_headers()
-            if self.command != "HEAD":
-                while chunk := response.read1(64 * 1024) if hasattr(response, "read1") else response.read(64 * 1024):
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            self.close_connection = True
-        finally:
-            connection.close()
-
-    # -- helpers -----------------------------------------------------------------
 
     def read_body(self) -> bytes | None:
         try:
@@ -257,32 +206,28 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Gateway: llama-server proxy + PaddleOCR route.")
+    parser = argparse.ArgumentParser(description="PaddleOCR HTTP server.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8090)
-    parser.add_argument("--upstream", default="http://127.0.0.1:8091", help="llama-server base URL")
-    parser.add_argument("--paddle-model", default="v6-small", help=f"{', '.join(PADDLE_PRESETS)} or 'off'")
+    parser.add_argument("--paddle-model", default="v6-small", help=", ".join(PADDLE_PRESETS))
     parser.add_argument("--warm-up-only", action="store_true", help="load PaddleOCR (downloading its models) and exit")
     arguments = parser.parse_args()
 
-    if arguments.paddle_model != "off":
-        try:
-            Handler.paddle = Paddle(arguments.paddle_model)
-            Handler.paddle.warm_up()
-            print(f"PaddleOCR ready ({arguments.paddle_model})", flush=True)
-        except Exception as error:  # noqa: BLE001
-            Handler.paddle_error = f"PaddleOCR could not be loaded: {error}"
-            print(Handler.paddle_error, flush=True)
-            if arguments.warm_up_only:
-                return 1
+    try:
+        Handler.paddle = Paddle(arguments.paddle_model)
+        Handler.paddle.warm_up()
+        print(f"PaddleOCR ready ({arguments.paddle_model})", flush=True)
+    except Exception as error:  # noqa: BLE001
+        Handler.paddle_error = f"PaddleOCR could not be loaded: {error}"
+        print(Handler.paddle_error, flush=True)
+        return 1
     if arguments.warm_up_only:
         return 0
 
-    Handler.upstream = urllib.parse.urlsplit(arguments.upstream)
     Handler.api_key = os.environ.get("OCR_API_KEY", "").strip()
     server = ThreadingHTTPServer((arguments.host, arguments.port), Handler)
     server.daemon_threads = True
-    print(f"Gateway listening on http://{arguments.host}:{arguments.port} -> {arguments.upstream}", flush=True)
+    print(f"PaddleOCR server listening on http://{arguments.host}:{arguments.port}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -3,24 +3,16 @@ import { BOX_FORMATS, type BoxFormat } from "@/lib/extraction/geometry";
 import { getModelId } from "./models";
 
 // How scanned pages are read. All of these come from .env:
-//   AI_OCR_ENGINE=llm|hunyuan|hybrid|paddle|paddle-llm|mistral|nemotron-v1|nemotron-v2   (default llm)
-//   AI_VISION_BOX_FORMAT=auto|xyxy999|yxyx1000|xyxy1000   (default auto)
-//   AI_VISION_TILES=1..4                 (default 1 = whole page in one call)
+//   AI_OCR_ENGINE=nemotron-v1|paddle-llm                   (default nemotron-v1)
+//   AI_VISION_BOX_FORMAT=auto|xyxy999|yxyx1000|xyxy1000    (default auto; how the vision model boxes drawings)
+//   AI_OCR_ENHANCE=on|off                                  (default off)
+// Other readers tried during development are archived in /old_ocr (not in git).
 
-export const OCR_ENGINES = [
-  "llm",
-  "hunyuan",
-  "hybrid",
-  "paddle",
-  "paddle-llm",
-  "mistral",
-  "nemotron-v1",
-  "nemotron-v2",
-] as const;
+export const OCR_ENGINES = ["nemotron-v1", "paddle-llm"] as const;
 export type OcrEngine = (typeof OCR_ENGINES)[number];
 
 export function getOcrEngine(): OcrEngine {
-  const value = process.env.AI_OCR_ENGINE?.trim().toLowerCase() || "llm";
+  const value = process.env.AI_OCR_ENGINE?.trim().toLowerCase() || "nemotron-v1";
   if (!OCR_ENGINES.includes(value as OcrEngine)) {
     throw new Error(`AI_OCR_ENGINE must be one of: ${OCR_ENGINES.join(", ")} (got "${value}").`);
   }
@@ -45,38 +37,11 @@ export function resolveBoxFormat(modelId: string, setting?: string | null): BoxF
   return "xyxy1000";
 }
 
-export function resolveTiles(setting?: string | null): number {
-  const tiles = Number(setting?.trim() || 1);
-  if (!Number.isInteger(tiles) || tiles < 1 || tiles > 4) {
-    throw new Error(`Tiles must be a whole number from 1 to 4 (got "${setting}").`);
-  }
-  return tiles;
-}
-
-/**
- * The /ocr page's Groq column: a second vision LLM served by Groq, read with
- * the same reader as AI_VISION_MODEL.
- *   GROQ_OCR_MODEL=qwen/qwen3.8-27b   (default; a Groq model id that accepts images)
- *   GROQ_OCR_TILES=1                  (default 1: Groq's free tier allows ~8k input and
- *                                      ~1k output tokens/min; a page is ~2k in per strip)
- *   GROQ_OCR_BOX_FORMAT=auto
- */
-export function getGroqOcrSettings() {
-  const modelId = `groq:${process.env.GROQ_OCR_MODEL?.trim() || "qwen/qwen3.8-27b"}`;
-  return {
-    modelId,
-    configured: Boolean(process.env.GROQ_API_KEY?.trim()),
-    boxFormat: resolveBoxFormat(modelId, process.env.GROQ_OCR_BOX_FORMAT),
-    tiles: resolveTiles(process.env.GROQ_OCR_TILES),
-  };
-}
-
-export function getVisionSettings(overrides: { boxFormat?: string | null; tiles?: string | null } = {}) {
+export function getVisionSettings() {
   const modelId = getModelId("vision");
   return {
     modelId,
-    boxFormat: resolveBoxFormat(modelId, overrides.boxFormat ?? process.env.AI_VISION_BOX_FORMAT),
-    tiles: resolveTiles(overrides.tiles ?? process.env.AI_VISION_TILES),
+    boxFormat: resolveBoxFormat(modelId, process.env.AI_VISION_BOX_FORMAT),
     enhance: getOcrEnhance(),
   };
 }

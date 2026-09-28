@@ -10,7 +10,7 @@ import { getOcrEngine, getVisionSettings } from "@/lib/ai/vision-settings";
 import { runExtraction, UserFacingError } from "@/lib/extraction/pipeline";
 import { extractionRequestSchema } from "@/lib/extraction/request-schema";
 import type { ExtractionEvent, TextLine } from "@/lib/extraction/types";
-import { OcrServiceError } from "@/lib/ocr/hunyuan";
+import { OcrServiceError } from "@/lib/ocr/http";
 import { createPageReader } from "@/lib/ocr/readers";
 import { downloadExamFile } from "@/lib/supabase-admin";
 
