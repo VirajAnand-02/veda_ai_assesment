@@ -2,7 +2,7 @@
 
 import Image from "next/image";
 import { ChevronDown, ChevronUp, GripVertical, Plus, Upload, X } from "lucide-react";
-import { Fragment, useId, useState, type ComponentProps, type DragEvent, type ReactNode } from "react";
+import { Fragment, useId, useRef, useState, type DragEvent, type PointerEvent, type ReactNode } from "react";
 import { cn } from "@/lib/cn";
 import { ACCEPTED_TYPES } from "@/lib/extraction/constants";
 import type { UploadKind } from "@/lib/uploads";
@@ -98,38 +98,57 @@ function DropLine() {
 
 /**
  * Row used once there are several answer sheets. Drag it (or use the arrows)
- * to set the order the pages are read in.
+ * to set the order the pages are read in: with a mouse by the whole row, on a
+ * touch screen by the grip, so swiping the list still scrolls it.
  */
 function SheetRow({
   file,
   index,
   count,
-  dragging,
+  dragOffset,
+  rowRef,
   onRemove,
   onMove,
-  dragHandlers,
+  onDragStart,
 }: {
   file: File;
   index: number;
   count: number;
-  /** This row is the one being dragged. */
-  dragging: boolean;
+  /** How far this row has been dragged (px), or null when it isn't being dragged. */
+  dragOffset: number | null;
+  rowRef: (element: HTMLLIElement | null) => void;
   onRemove: () => void;
   onMove: (delta: -1 | 1) => void;
-  dragHandlers: Pick<
-    ComponentProps<"li">,
-    "draggable" | "onDragStart" | "onDragOver" | "onDrop" | "onDragEnd"
-  >;
+  onDragStart: (event: PointerEvent<HTMLElement>) => void;
 }) {
+  const dragging = dragOffset !== null;
   return (
     <li
-      {...dragHandlers}
+      ref={rowRef}
+      onPointerDown={(event) => {
+        // Mouse: anywhere but the buttons. Touch: the grip only (below).
+        if (event.pointerType !== "mouse" || (event.target as HTMLElement).closest("button")) return;
+        onDragStart(event);
+      }}
+      // Stops the browser's own image drag from taking over.
+      onDragStart={(event) => event.preventDefault()}
+      style={dragging ? { transform: `translateY(${dragOffset}px) scale(1.02)` } : undefined}
       className={cn(
-        "group/row flex shrink-0 animate-pop cursor-grab items-center gap-2 rounded-xl bg-off-white py-1.5 pr-1.5 pl-1 transition-[box-shadow,opacity] hover:shadow-[0_2px_8px_rgba(0,0,0,0.08)] active:cursor-grabbing",
-        dragging && "opacity-40",
+        "group/row relative flex shrink-0 animate-pop items-center gap-2 rounded-xl py-1.5 pr-1.5 pl-1 select-none",
+        dragging
+          ? "z-20 cursor-grabbing bg-white shadow-[0_10px_24px_rgba(0,0,0,0.18)] ring-1 ring-primary/40"
+          : "bg-off-white transition-[box-shadow,transform] duration-150 hover:shadow-[0_2px_8px_rgba(0,0,0,0.08)] [@media(pointer:fine)]:cursor-grab",
       )}
     >
-      <GripVertical size={16} aria-hidden className="shrink-0 text-disabled transition-colors group-hover/row:text-muted" />
+      <span
+        aria-hidden
+        onPointerDown={(event) => {
+          if (event.pointerType !== "mouse") onDragStart(event);
+        }}
+        className="flex h-10 w-6 shrink-0 cursor-grab touch-none items-center justify-center rounded-md text-disabled transition-colors group-hover/row:text-muted active:cursor-grabbing"
+      >
+        <GripVertical size={16} />
+      </span>
       <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-ink-strong/80 text-[12px] font-bold text-white">
         {index + 1}
       </span>
@@ -293,6 +312,70 @@ function QuestionSlot({
   );
 }
 
+/** Scroll the list when a drag comes this close to its top or bottom edge (px). */
+const AUTOSCROLL_EDGE = 36;
+const AUTOSCROLL_STEP = 12;
+
+/**
+ * Pointer-based reordering (mouse, touch and pen alike): the dragged row
+ * follows the pointer, a line shows where it will land, and the list scrolls
+ * near its edges.
+ */
+function useSheetSorting(count: number, onReorder: (from: number, to: number) => void) {
+  // `gap`: where the sheet would land, 0 = before the first row, count = after the last.
+  const [drag, setDrag] = useState<{ from: number; offset: number; gap: number } | null>(null);
+  const rows = useRef<(HTMLLIElement | null)[]>([]);
+  const listRef = useRef<HTMLOListElement | null>(null);
+
+  function startDrag(from: number, event: PointerEvent<HTMLElement>) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const list = listRef.current;
+    const startY = event.clientY;
+    const startScroll = list?.scrollTop ?? 0;
+    // Row midpoints in list coordinates, measured once before anything moves.
+    const middles = rows.current.map((row) => (row ? row.offsetTop + row.offsetHeight / 2 : 0));
+    let gap = from;
+
+    const move = (moveEvent: globalThis.PointerEvent) => {
+      if (list) {
+        const rect = list.getBoundingClientRect();
+        if (moveEvent.clientY < rect.top + AUTOSCROLL_EDGE) list.scrollTop -= AUTOSCROLL_STEP;
+        else if (moveEvent.clientY > rect.bottom - AUTOSCROLL_EDGE) list.scrollTop += AUTOSCROLL_STEP;
+      }
+      const scrolled = (list?.scrollTop ?? 0) - startScroll;
+      const offset = moveEvent.clientY - startY + scrolled;
+      const draggedMiddle = middles[from] + offset;
+      gap = middles.filter((middle, index) => index !== from && middle < draggedMiddle).length;
+      if (gap >= from) gap += 1; // counts skipped the dragged row itself
+      setDrag({ from, offset, gap });
+    };
+    const end = (endEvent: globalThis.PointerEvent) => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", end);
+      window.removeEventListener("pointercancel", end);
+      setDrag(null);
+      if (endEvent.type === "pointerup" && gap !== from && gap !== from + 1) onReorder(from, gap > from ? gap - 1 : gap);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", end);
+    window.addEventListener("pointercancel", end);
+    setDrag({ from, offset: 0, gap: from });
+  }
+
+  return {
+    drag,
+    listRef,
+    rowRef: (index: number) => (element: HTMLLIElement | null) => {
+      rows.current[index] = element;
+      rows.current.length = count;
+    },
+    startDrag,
+    // Dropping a sheet just above or below itself changes nothing, so no line there.
+    showLineAt: (gap: number) => drag !== null && drag.gap === gap && gap !== drag.from && gap !== drag.from + 1,
+  };
+}
+
 function AnswerSlot({
   files,
   onSelect,
@@ -308,40 +391,7 @@ function AnswerSlot({
   onReorder: (from: number, to: number) => void;
 }) {
   const picker = useFilePicker(true, onSelect);
-  // The sheet being dragged, and the gap it would drop into (0 = before the first).
-  const [dragFrom, setDragFrom] = useState<number | null>(null);
-  const [dropAt, setDropAt] = useState<number | null>(null);
-  const endDrag = () => {
-    setDragFrom(null);
-    setDropAt(null);
-  };
-  // Dropping a sheet just above or below itself changes nothing, so no line there.
-  const showLineAt = (gap: number) => dragFrom !== null && dropAt === gap && gap !== dragFrom && gap !== dragFrom + 1;
-
-  const dragHandlers = (index: number) => ({
-    draggable: true,
-    onDragStart: (event: DragEvent) => {
-      event.dataTransfer.effectAllowed = "move";
-      event.dataTransfer.setData("text/plain", files[index].name);
-      setDragFrom(index);
-    },
-    onDragOver: (event: DragEvent) => {
-      if (dragFrom === null) return;
-      event.preventDefault();
-      event.dataTransfer.dropEffect = "move";
-      const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
-      setDropAt(event.clientY < rect.top + rect.height / 2 ? index : index + 1);
-    },
-    onDrop: (event: DragEvent) => {
-      if (dragFrom === null) return;
-      event.preventDefault();
-      if (dropAt !== null && dropAt !== dragFrom && dropAt !== dragFrom + 1) {
-        onReorder(dragFrom, dropAt > dragFrom ? dropAt - 1 : dropAt);
-      }
-      endDrag();
-    },
-    onDragEnd: endDrag,
-  });
+  const { drag, rowRef, listRef, startDrag, showLineAt } = useSheetSorting(files.length, onReorder);
 
   if (files.length === 0) {
     return <EmptySlot label="Answer Sheet" hint="Max 10MB each · add one file per sheet" picker={picker} />;
@@ -371,20 +421,9 @@ function AnswerSlot({
             Drag to set the page order
           </p>
           <ol
+            ref={listRef}
             aria-label="Answer sheets, in page order"
             className="flex max-h-[360px] min-h-0 flex-col gap-1.5 overflow-y-auto lg:max-h-none lg:flex-1"
-            // Dropping below the last row.
-            onDragOver={(event) => {
-              if (dragFrom === null || event.target !== event.currentTarget) return;
-              event.preventDefault();
-              setDropAt(files.length);
-            }}
-            onDrop={(event) => {
-              if (dragFrom === null || event.target !== event.currentTarget) return;
-              event.preventDefault();
-              if (dropAt === files.length && dragFrom !== files.length - 1) onReorder(dragFrom, files.length - 1);
-              endDrag();
-            }}
           >
             {files.map((file, index) => (
               <Fragment key={`${file.name}-${file.lastModified}-${file.size}`}>
@@ -393,10 +432,11 @@ function AnswerSlot({
                   file={file}
                   index={index}
                   count={files.length}
-                  dragging={dragFrom === index}
+                  dragOffset={drag?.from === index ? drag.offset : null}
+                  rowRef={rowRef(index)}
                   onRemove={() => onRemove(index)}
                   onMove={(delta) => onMove(index, delta)}
-                  dragHandlers={dragHandlers(index)}
+                  onDragStart={(event) => startDrag(index, event)}
                 />
               </Fragment>
             ))}
