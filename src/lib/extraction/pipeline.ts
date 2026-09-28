@@ -65,77 +65,192 @@ type QuestionPaper = { questions: ExtractedQuestion[]; choices: ChoiceRule[] };
 
 type AnswerSegment = ExtractedAnswer & { id: string };
 
-// Small concurrency limit for per-page vision calls.
+// Small concurrency limit for per-page reading calls.
 const PAGE_CONCURRENCY = 3;
 const REGION_PADDING = 0.012;
 
-export async function runExtraction(
-  request: ExtractionRequest,
+// ---------------------------------------------------------------------------
+// Running in steps
+//
+// A run is made of units of work: reading a page, extracting the questions and
+// answers, mapping, grading one batch, and the overall feedback.
+// advanceExtraction does units until the next one might not finish before a
+// deadline, then returns; the state it leaves is plain JSON, so it can be saved
+// and a later call (another request, with its own time limit) carries on.
+
+/** About how long each kind of unit can take; one starts only if it would still finish before the deadline. */
+const UNIT_TIME_MS = { page: 60_000, extract: 150_000, mapping: 60_000, grading: 90_000, overall: 30_000 };
+type UnitKind = keyof typeof UNIT_TIME_MS;
+
+type SheetKind = "question" | "answer";
+type Grade = z.infer<typeof gradingSchema>["grades"][number];
+
+/** A run's progress so far, saved between steps (plain JSON). */
+export type RunState = {
+  request: ExtractionRequest;
+  /** Each page's lines, null until read. */
+  pages: Record<SheetKind, (TextLine[] | null)[]>;
+  paper: QuestionPaper | null;
+  segments: AnswerSegment[] | null;
+  /** Answer block id -> the ids of the questions it answers. */
+  matches: Record<string, string[]> | null;
+  /** Grades per batch, null until graded ([] when the batch failed). */
+  grading: { batches: string[][]; grades: (Grade[] | null)[]; failed: string[] } | null;
+  /** Units finished so far, and steps in a row that ran out of time without finishing one. */
+  unitsDone: number;
+  stalls: number;
+};
+
+export function newRunState(request: ExtractionRequest): RunState {
+  return {
+    request,
+    pages: { question: request.question.pages.map(() => null), answer: request.answer.pages.map(() => null) },
+    paper: null,
+    segments: null,
+    matches: null,
+    grading: null,
+    unitsDone: 0,
+    stalls: 0,
+  };
+}
+
+/** Runs a whole extraction in one go. */
+export async function runExtraction(request: ExtractionRequest, deps: PipelineDeps): Promise<ExtractionResult> {
+  const state = newRunState(request);
+  let result: ExtractionResult | null = null;
+  while (!result) result = await advanceExtraction(state, deps);
+  return result;
+}
+
+/**
+ * Does the run's remaining work unit by unit, updating `state` as each one
+ * finishes. Returns the result once done, or null when the next unit might not
+ * finish before `deadline` (call again, with a new deadline, to go on). The
+ * first unit of a call always starts, so every call makes progress.
+ */
+export async function advanceExtraction(
+  state: RunState,
   deps: PipelineDeps,
-): Promise<ExtractionResult> {
-  const [questionLines, answerLines] = await Promise.all([
-    readDocument("reading-question", request.question.pages, deps),
-    readDocument("reading-answer", request.answer.pages, deps),
-  ]);
+  deadline = Infinity,
+): Promise<ExtractionResult | null> {
+  let started = 0;
+  const fits = (kind: UnitKind) => {
+    const ok = started === 0 || Date.now() + UNIT_TIME_MS[kind] <= deadline;
+    if (ok) started++;
+    return ok;
+  };
+  const unread = () => state.pages.question.includes(null) || state.pages.answer.includes(null);
 
-  const [paper, segments] = await Promise.all([
-    stage(deps, "questions", () => extractQuestions(questionLines, deps), (found) =>
-      `${found.questions.length} found`,
-    ),
-    stage(deps, "answers", () => extractAnswers(answerLines, deps), (found) =>
-      `${found.length} found`,
-    ),
-  ]);
-  const { questions } = paper;
-
-  const matches = await stage(deps, "mapping", () => mapAnswers(questions, segments, deps));
-
-  // A block can answer several sub-parts at once (e.g. 1(a)(i) and (ii) written together).
-  const answersByQuestion = new Map<string, AnswerSegment[]>();
-  const unmatchedAnswers: UnmatchedAnswer[] = [];
-  for (const segment of segments) {
-    const questionIds = matches.get(segment.id) ?? [];
-    for (const questionId of questionIds) {
-      answersByQuestion.set(questionId, [...(answersByQuestion.get(questionId) ?? []), segment]);
-    }
-    if (questionIds.length === 0) unmatchedAnswers.push(segment);
+  if (unread()) {
+    await Promise.all([readDocument(state, "question", deps, fits), readDocument(state, "answer", deps, fits)]);
+    if (unread()) return null;
   }
 
-  const { questions: graded, summary } = await stage(deps, "grading", () =>
-    gradeAnswers(paper, answersByQuestion, deps),
-  );
+  if (!state.paper || !state.segments) {
+    if (!fits("extract")) return null;
+    const work: Promise<void>[] = [];
+    if (!state.paper) {
+      const lines = toLines(state.pages.question);
+      work.push(
+        stage(deps, "questions", () => extractQuestions(lines, deps), (found) => `${found.questions.length} found`).then(
+          (paper) => void (state.paper = paper),
+        ),
+      );
+    }
+    if (!state.segments) {
+      const lines = toLines(state.pages.answer);
+      work.push(
+        stage(deps, "answers", () => extractAnswers(lines, deps), (found) => `${found.length} found`).then(
+          (segments) => void (state.segments = segments),
+        ),
+      );
+    }
+    await Promise.all(work);
+    state.unitsDone++;
+  }
+  const paper = state.paper!;
+  const segments = state.segments!;
 
-  return { questions: graded, unmatchedAnswers, summary };
+  if (!state.matches) {
+    if (!fits("mapping")) return null;
+    const matches = await stage(deps, "mapping", () => mapAnswers(paper.questions, segments, deps));
+    state.matches = Object.fromEntries(matches);
+    state.unitsDone++;
+  }
+  const { answers, unmatchedAnswers } = collectAnswers(paper.questions, segments, state.matches);
+
+  state.grading ??= (() => {
+    const batches = planGrading(paper.questions, answers);
+    return { batches, grades: batches.map(() => null), failed: [] };
+  })();
+  const grading = state.grading;
+  const pending = grading.grades.flatMap((grades, index) => (grades ? [] : [index]));
+  if (pending.length) {
+    const report = () => {
+      const done = grading.grades.filter(Boolean).length;
+      deps.onProgress({ type: "progress", stage: "grading", status: "active", detail: `${done} of ${grading.batches.length} batches` });
+    };
+    report();
+    await forEachWhile(pending, GRADING_CONCURRENCY, () => fits("grading"), async (index) => {
+      grading.grades[index] = await gradeBatch(grading.batches[index], paper.questions, answers, grading.failed, deps);
+      state.unitsDone++;
+      report();
+    });
+    if (grading.grades.includes(null)) return null;
+  }
+
+  if (!fits("overall")) return null;
+  const { questions, summary } = await finishGrading(paper, answers, grading, deps);
+  deps.onProgress({ type: "progress", stage: "grading", status: "done" });
+  state.unitsDone++;
+  return { questions, unmatchedAnswers, summary };
 }
 
 // ---------------------------------------------------------------------------
 // Reading
 
 async function readDocument(
-  stageName: Extract<ServerStage, "reading-question" | "reading-answer">,
-  pages: PageInput[],
+  state: RunState,
+  sheet: SheetKind,
   deps: PipelineDeps,
-): Promise<Line[]> {
-  let done = 0;
+  fits: (kind: UnitKind) => boolean,
+): Promise<void> {
+  const read = state.pages[sheet];
+  if (!read.includes(null)) return;
+  const pages: PageInput[] = state.request[sheet].pages;
+  const stageName: ServerStage = sheet === "question" ? "reading-question" : "reading-answer";
   const report = () =>
-    deps.onProgress({ type: "progress", stage: stageName, status: "active", detail: `Page ${done} of ${pages.length}` });
+    deps.onProgress({
+      type: "progress",
+      stage: stageName,
+      status: "active",
+      detail: `Page ${read.filter(Boolean).length} of ${read.length}`,
+    });
+
+  // Pages with a text layer (typed PDFs) need no reading.
+  read.forEach((lines, index) => {
+    if (!lines && pages[index].lines?.some((line) => line.text.trim())) read[index] = pages[index].lines!;
+  });
   report();
 
-  const perPage = await mapWithLimit(pages, PAGE_CONCURRENCY, async (page) => {
-    const hasTextLayer = page.lines?.some((line) => line.text.trim());
-    const lines = hasTextLayer
-      ? page.lines!
-      : await deps.readPage(await deps.loadPageImage(page.path));
-    done++;
+  const unread = read.flatMap((lines, index) => (lines ? [] : [index]));
+  await forEachWhile(unread, PAGE_CONCURRENCY, () => fits("page"), async (index) => {
+    read[index] = await untilAborted(
+      (async () => deps.readPage(await deps.loadPageImage(pages[index].path)))(),
+      deps.signal,
+    );
+    state.unitsDone++;
     report();
-    return lines;
   });
 
-  deps.onProgress({ type: "progress", stage: stageName, status: "done" });
+  if (!read.includes(null)) deps.onProgress({ type: "progress", stage: stageName, status: "done" });
+}
 
+/** Numbers every non-empty line ("p2-l14"), in page order. */
+function toLines(pages: (TextLine[] | null)[]): Line[] {
   const lines: Line[] = [];
-  perPage.forEach((pageLines, page) => {
-    pageLines
+  pages.forEach((pageLines, page) => {
+    (pageLines ?? [])
       .filter((line) => line.text.trim())
       .forEach((line, index) => {
         lines.push({
@@ -462,61 +577,89 @@ const ESTIMATED_MARKS = 3;
 const UNANSWERED_WEIGHT = 1;
 const GRADING_CONCURRENCY = 3;
 
-async function gradeAnswers(
-  { questions, choices }: QuestionPaper,
-  answersByQuestion: Map<string, AnswerSegment[]>,
-  deps: PipelineDeps,
-): Promise<{ questions: GradedQuestion[]; summary: GradingSummary }> {
-  const answers = new Map(
-    questions.map((question) => [question.id, mergeAnswers(answersByQuestion.get(question.id))]),
-  );
-  const marksOf = (question: ExtractedQuestion) => question.printedMarks ?? ESTIMATED_MARKS;
-  const byId = new Map(questions.map((question) => [question.id, question]));
+/** Each question's (merged) answer, or null when unanswered. */
+type Answers = Map<string, ExtractedAnswer | null>;
 
-  // About one batch per 9 marks, small questions together (grading-batches.ts),
-  // each thinking as hard as its questions need (lib/ai/reasoning.ts).
-  const batches = planBatches(
+const marksOf = (question: ExtractedQuestion) => question.printedMarks ?? ESTIMATED_MARKS;
+
+// A block can answer several sub-parts at once (e.g. 1(a)(i) and (ii) written together).
+function collectAnswers(questions: ExtractedQuestion[], segments: AnswerSegment[], matches: Record<string, string[]>) {
+  const byQuestion = new Map<string, AnswerSegment[]>();
+  const unmatchedAnswers: UnmatchedAnswer[] = [];
+  for (const segment of segments) {
+    const questionIds = matches[segment.id] ?? [];
+    for (const questionId of questionIds) {
+      byQuestion.set(questionId, [...(byQuestion.get(questionId) ?? []), segment]);
+    }
+    if (questionIds.length === 0) unmatchedAnswers.push(segment);
+  }
+  const answers: Answers = new Map(questions.map((question) => [question.id, mergeAnswers(byQuestion.get(question.id))]));
+  return { answers, unmatchedAnswers };
+}
+
+/** About one batch per 9 marks, small questions together (grading-batches.ts). */
+function planGrading(questions: ExtractedQuestion[], answers: Answers): string[][] {
+  return planBatches(
     questions.map((question) => ({
       id: question.id,
       marks: answers.get(question.id) ? marksOf(question) : UNANSWERED_WEIGHT,
     })),
   );
-  const failed: string[] = [];
-  const batchGrades = await mapWithLimit(batches, GRADING_CONCURRENCY, async (ids) => {
-    const batch = ids.map((id) => byId.get(id)!);
-    const answered = batch.filter((question) => answers.get(question.id));
-    const tier = gradingTier({
-      answeredMarks: answered.map(marksOf),
-      answerChars: answered.map((question) => answers.get(question.id)!.text.length),
-      complex: answered.some((question) => marksOf(question) >= 5 && COMPLEX_QUESTION.test(`${question.context ?? ""} ${question.text}`)),
-    });
-    const prompt = batch
-      .map((question) => {
-        const answer = answers.get(question.id);
-        return [
-          `### ${question.id} — Question ${question.label}`,
-          `Marks: ${question.printedMarks ?? "not printed"}`,
-          question.context ? `Context: ${question.context}` : null,
-          `Question: ${question.text}`,
-          // Answers with tables run long (two comparison tables are ~2,000 characters).
-          `Student's answer: ${answer ? truncate(answer.text, 5000) : "NO ANSWER"}`,
-        ]
-          .filter(Boolean)
-          .join("\n");
-      })
-      .join("\n\n");
-    const label = `grading ${batch.map((question) => question.label).join(", ")}`;
-    try {
-      return (await ask(deps, deps.textModel, gradingSchema, GRADING_INSTRUCTIONS, { prompt }, { tier, label })).grades;
-    } catch (error) {
-      if (deps.signal?.aborted) throw error;
-      // The rest of the paper is still graded; these questions are flagged for review.
-      console.warn(`Grading failed for ${batch.map((question) => question.label).join(", ")}.`, error);
-      failed.push(...batch.map((question) => question.label));
-      return [];
-    }
+}
+
+/**
+ * Grades one batch, thinking as hard as its questions need (lib/ai/reasoning.ts).
+ * A batch that fails returns no grades and is noted in `failed`, so the rest of
+ * the paper is still graded.
+ */
+async function gradeBatch(
+  ids: string[],
+  questions: ExtractedQuestion[],
+  answers: Answers,
+  failed: string[],
+  deps: PipelineDeps,
+): Promise<Grade[]> {
+  const batch = ids.flatMap((id) => questions.find((question) => question.id === id) ?? []);
+  const answered = batch.filter((question) => answers.get(question.id));
+  const tier = gradingTier({
+    answeredMarks: answered.map(marksOf),
+    answerChars: answered.map((question) => answers.get(question.id)!.text.length),
+    complex: answered.some((question) => marksOf(question) >= 5 && COMPLEX_QUESTION.test(`${question.context ?? ""} ${question.text}`)),
   });
-  const grades = new Map(batchGrades.flat().map((grade) => [grade.questionId.trim(), grade]));
+  const prompt = batch
+    .map((question) => {
+      const answer = answers.get(question.id);
+      return [
+        `### ${question.id} — Question ${question.label}`,
+        `Marks: ${question.printedMarks ?? "not printed"}`,
+        question.context ? `Context: ${question.context}` : null,
+        `Question: ${question.text}`,
+        // Answers with tables run long (two comparison tables are ~2,000 characters).
+        `Student's answer: ${answer ? truncate(answer.text, 5000) : "NO ANSWER"}`,
+      ]
+        .filter(Boolean)
+        .join("\n");
+    })
+    .join("\n\n");
+  const labels = batch.map((question) => question.label).join(", ");
+  try {
+    return (await ask(deps, deps.textModel, gradingSchema, GRADING_INSTRUCTIONS, { prompt }, { tier, label: `grading ${labels}` })).grades;
+  } catch (error) {
+    if (deps.signal?.aborted) throw error;
+    console.warn(`Grading failed for ${labels}.`, error);
+    failed.push(...batch.map((question) => question.label));
+    return [];
+  }
+}
+
+/** Scores, "answer any N" rules, the summary and the overall feedback, from the batches' grades. */
+async function finishGrading(
+  { questions, choices }: QuestionPaper,
+  answers: Answers,
+  { grades: batchGrades, failed }: NonNullable<RunState["grading"]>,
+  deps: PipelineDeps,
+): Promise<{ questions: GradedQuestion[]; summary: GradingSummary }> {
+  const grades = new Map(batchGrades.flatMap((batch) => batch ?? []).map((grade) => [grade.questionId.trim(), grade]));
 
   const scored = questions.map(({ printedMarks, ...question }) => {
     const grade = grades.get(question.id);
@@ -692,17 +835,24 @@ function formatLines(lines: Line[]) {
   return out.join("\n");
 }
 
-async function mapWithLimit<T, R>(items: T[], limit: number, run: (item: T) => Promise<R>) {
-  const results: R[] = new Array(items.length);
+/** Runs items at most `limit` at a time; a worker takes the next item only while canStart() allows it. */
+async function forEachWhile<T>(items: T[], limit: number, canStart: () => boolean, run: (item: T) => Promise<void>) {
   let next = 0;
   const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) {
-      const index = next++;
-      results[index] = await run(items[index]);
-    }
+    while (next < items.length && canStart()) await run(items[next++]);
   });
   await Promise.all(workers);
-  return results;
+}
+
+/** Rejects as soon as `signal` aborts, for work that can't be cancelled itself. */
+function untilAborted<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return work;
+  return new Promise<T>((resolve, reject) => {
+    if (signal.aborted) return reject(signal.reason);
+    const abort = () => reject(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    work.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+  });
 }
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));

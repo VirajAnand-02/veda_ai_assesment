@@ -3,8 +3,10 @@ import { getSupabaseAdmin } from "@/lib/supabase-admin";
 import type { ExtractionJob, ExtractionResult, ProgressEvent } from "./types";
 
 // Extraction runs as a job the page polls, instead of one long streamed
-// request. Job state is a small JSON file in a private Supabase bucket, so any
-// server instance can answer a poll. The bucket is created on first use.
+// request. Two small JSON files per job live in a private Supabase bucket, so
+// any server instance can pick them up: "<id>.json" is what the page polls
+// (status, progress, result), "<id>.state.json" the run's work so far, kept
+// between steps. The bucket is created on first use.
 
 const JOBS_BUCKET = "extraction-jobs";
 /** A running job rewrites its file at least this often. */
@@ -24,6 +26,7 @@ export function newJobId(submissionId: string) {
 export const isJobId = (value: string) => JOB_ID.test(value);
 
 const jobPath = (id: string) => `${id}.json`;
+const statePath = (id: string) => `${id}.state.json`;
 
 let bucketReady: Promise<void> | null = null;
 function ensureBucket(): Promise<void> {
@@ -40,31 +43,42 @@ function ensureBucket(): Promise<void> {
   return bucketReady;
 }
 
-async function writeJob(job: ExtractionJob): Promise<void> {
+async function writeJson(path: string, value: unknown): Promise<void> {
   await ensureBucket();
   const { error } = await getSupabaseAdmin()
     .storage.from(JOBS_BUCKET)
-    .upload(jobPath(job.id), JSON.stringify(job), { upsert: true, contentType: "application/json", cacheControl: "0" });
+    .upload(path, JSON.stringify(value), { upsert: true, contentType: "application/json", cacheControl: "0" });
   if (error) throw new Error(`Could not save extraction progress: ${error.message}`);
+}
+
+async function readJson<T>(path: string): Promise<T | null> {
+  await ensureBucket();
+  const { data, error } = await getSupabaseAdmin().storage.from(JOBS_BUCKET).download(path);
+  if (error || !data) return null;
+  return JSON.parse(await data.text()) as T;
 }
 
 export async function readJob(id: string): Promise<ExtractionJob | null> {
   if (!isJobId(id)) return null;
-  await ensureBucket();
-  const { data, error } = await getSupabaseAdmin().storage.from(JOBS_BUCKET).download(jobPath(id));
-  if (error || !data) return null;
-  const job = JSON.parse(await data.text()) as ExtractionJob;
+  const job = await readJson<ExtractionJob>(jobPath(id));
   // A running job whose writer went silent has stopped.
-  if (job.status === "running" && Date.now() - job.updatedAt > STALE_MS) {
+  if (job?.status === "running" && Date.now() - job.updatedAt > STALE_MS) {
     return { ...job, status: "error", error: "The extraction stopped unexpectedly (the server may have timed out). Please try again." };
   }
   return job;
 }
 
+/** The run's work so far (see RunState in pipeline.ts), kept between steps. */
+export const saveRunState = (id: string, state: unknown) => writeJson(statePath(id), state);
+export const loadRunState = <T>(id: string) => readJson<T>(statePath(id));
+export async function deleteRunState(id: string) {
+  await getSupabaseAdmin().storage.from(JOBS_BUCKET).remove([statePath(id)]);
+}
+
 /**
- * Writes a job's progress as it runs: progress events are coalesced, a
- * heartbeat keeps it fresh during long stages, and the final state is written
- * straight away.
+ * Writes a job's progress during one step: progress events are coalesced, a
+ * heartbeat keeps it fresh during long units, and the end of the step (done,
+ * failed, or waiting for the next step) is written straight away.
  */
 export class JobWriter {
   private job: ExtractionJob;
@@ -73,11 +87,22 @@ export class JobWriter {
   private heartbeat: ReturnType<typeof setInterval> | null = null;
   private lastWrite = 0;
 
-  constructor(id: string) {
-    this.job = { id, status: "running", events: [], updatedAt: Date.now() };
+  /** A new job, or the next step of an existing one. */
+  constructor(id: string, previous?: ExtractionJob) {
+    this.job = previous
+      ? { ...previous, status: "running" }
+      : { id, status: "running", step: 0, events: [], updatedAt: Date.now() };
   }
 
-  /** Saves the new job before the run starts. */
+  get id() {
+    return this.job.id;
+  }
+
+  get step() {
+    return this.job.step;
+  }
+
+  /** Saves the job as running before the step starts. */
   async start() {
     await this.flush();
     this.heartbeat = setInterval(() => this.schedule(), HEARTBEAT_MS);
@@ -98,6 +123,12 @@ export class JobWriter {
     await this.close();
   }
 
+  /** Ends this step; the page starts the next one. */
+  async pause() {
+    this.job = { ...this.job, status: "waiting", step: this.job.step + 1 };
+    await this.close();
+  }
+
   private schedule() {
     if (this.timer) return;
     const wait = Math.max(0, WRITE_INTERVAL_MS - (Date.now() - this.lastWrite));
@@ -108,10 +139,11 @@ export class JobWriter {
   }
 
   private flush() {
-    // Writes go one after another, so an older state never lands last.
-    this.pending = this.pending.then(async () => {
+    // Writes go one after another, so an older state never lands last; one
+    // failed write (reported by its caller) doesn't stop the later ones.
+    this.pending = this.pending.catch(() => {}).then(async () => {
       this.lastWrite = Date.now();
-      await writeJob({ ...this.job, events: [...this.job.events], updatedAt: Date.now() });
+      await writeJson(jobPath(this.job.id), { ...this.job, events: [...this.job.events], updatedAt: Date.now() });
     });
     return this.pending;
   }

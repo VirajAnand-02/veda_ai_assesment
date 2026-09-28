@@ -84,10 +84,16 @@ export type ExtractionEvent =
 
 export type ProgressEvent = Extract<ExtractionEvent, { type: "progress" }>;
 
-/** A running or finished extraction, as polled by the page (GET /api/extract/<id>). */
+/**
+ * An extraction, as polled by the page (GET /api/extract/<id>). It runs in
+ * steps that each fit a request's time limit; between steps it is "waiting"
+ * for the page to start step `step` (POST /api/extract/<id>).
+ */
 export type ExtractionJob = {
   id: string;
-  status: "running" | "done" | "error";
+  status: "running" | "waiting" | "done" | "error";
+  /** The step running, or the next one to start when waiting (from 0). */
+  step: number;
   /** Progress so far, in order; the page replays the ones it hasn't seen. */
   events: ProgressEvent[];
   result?: ExtractionResult;
